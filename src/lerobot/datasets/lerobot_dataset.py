@@ -252,6 +252,8 @@ class LeRobotDatasetMetadata:
         episode_tasks: list[str],
         episode_stats: dict[str, dict],
     ) -> None:
+        import time
+        perf_counter_start = time.perf_counter()
         self.info["total_episodes"] += 1
         self.info["total_frames"] += episode_length
 
@@ -262,7 +264,10 @@ class LeRobotDatasetMetadata:
         self.info["splits"] = {"train": f"0:{self.info['total_episodes']}"}
         self.info["total_videos"] += len(self.video_keys)
 
+        t0 = time.perf_counter()
         write_info(self.info, self.root)
+        t1 = time.perf_counter()
+        print(f"[save_episode] write_info time: {t1 - t0:.6f} seconds")
 
         episode_dict = {
             "episode_index": episode_index,
@@ -270,11 +275,26 @@ class LeRobotDatasetMetadata:
             "length": episode_length,
         }
         self.episodes[episode_index] = episode_dict
+
+        t2 = time.perf_counter()
         write_episode(episode_dict, self.root)
+        t3 = time.perf_counter()
+        print(f"[save_episode] write_episode time: {t3 - t2:.6f} seconds")
 
         self.episodes_stats[episode_index] = episode_stats
+
+        t4 = time.perf_counter()
         self.stats = aggregate_stats([self.stats, episode_stats]) if self.stats else episode_stats
+        t5 = time.perf_counter()
+        print(f"[save_episode] aggregate_stats time: {t5 - t4:.6f} seconds")
+
+        t6 = time.perf_counter()
         write_episode_stats(episode_index, episode_stats, self.root)
+        t7 = time.perf_counter()
+        print(f"[save_episode] write_episode_stats time: {t7 - t6:.6f} seconds")
+
+        perf_counter_end = time.perf_counter()
+        print(f"[save_episode] total time: {perf_counter_end - perf_counter_start:.6f} seconds")
 
     def update_video_info(self) -> None:
         """
@@ -325,6 +345,12 @@ class LeRobotDatasetMetadata:
             raise ValueError()
         write_json(obj.info, obj.root / INFO_PATH)
         obj.revision = None
+
+        # ADD THESE LINES:
+        obj._img_pool = ThreadPoolExecutor(max_workers=8)
+        obj._img_sem = threading.Semaphore(256)
+        obj._img_futs = []    
+        
         return obj
 
 import threading
@@ -825,7 +851,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         validate_frame(frame, self.features)
 
         perf_counter_end = time.perf_counter()
-        print(f"ln787 validate frame time: {perf_counter_end - perf_counter_start}")
+        # print(f"ln787 validate frame time: {perf_counter_end - perf_counter_start}")
 
         if self.episode_buffer is None:
             self.episode_buffer = self.create_episode_buffer()
@@ -870,14 +896,25 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 save the current episode in self.episode_buffer, which is filled with 'add_frame'. Defaults to
                 None.
         """
-        self._flush_images()           # ensure all frames exist on disk
+        import time
 
+        t0 = time.perf_counter()
+        self._flush_images()           # ensure all frames exist on disk
+        t1 = time.perf_counter()
+        print(f"[save_episode] _flush_images time: {t1 - t0:.6f} seconds")
+
+        t2 = time.perf_counter()
         if not episode_data:
             episode_buffer = self.episode_buffer
         else:
             episode_buffer = episode_data
+        t3 = time.perf_counter()
+        print(f"[save_episode] episode_buffer selection time: {t3 - t2:.6f} seconds")
 
+        t4 = time.perf_counter()
         validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
+        t5 = time.perf_counter()
+        print(f"[save_episode] validate_episode_buffer time: {t5 - t4:.6f} seconds")
 
         # size and task are special cases that won't be added to hf_dataset
         episode_length = episode_buffer.pop("size")
@@ -885,39 +922,69 @@ class LeRobotDataset(torch.utils.data.Dataset):
         episode_tasks = list(set(tasks))
         episode_index = episode_buffer["episode_index"]
 
+        t6 = time.perf_counter()
         episode_buffer["index"] = np.arange(self.meta.total_frames, self.meta.total_frames + episode_length)
         episode_buffer["episode_index"] = np.full((episode_length,), episode_index)
+        t7 = time.perf_counter()
+        print(f"[save_episode] index/episode_index assignment time: {t7 - t6:.6f} seconds")
 
         # Add new tasks to the tasks dictionary
+        t8 = time.perf_counter()
         for task in episode_tasks:
             task_index = self.meta.get_task_index(task)
             if task_index is None:
                 self.meta.add_task(task)
+        t9 = time.perf_counter()
+        print(f"[save_episode] add_task time: {t9 - t8:.6f} seconds")
 
         # Given tasks in natural language, find their corresponding task indices
+        t10 = time.perf_counter()
         episode_buffer["task_index"] = np.array([self.meta.get_task_index(task) for task in tasks])
+        t11 = time.perf_counter()
+        print(f"[save_episode] task_index assignment time: {t11 - t10:.6f} seconds")
 
+        t12 = time.perf_counter()
         for key, ft in self.features.items():
             # index, episode_index, task_index are already processed above, and image and video
             # are processed separately by storing image path and frame info as meta data
             if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
                 continue
             episode_buffer[key] = np.stack(episode_buffer[key])
+        t13 = time.perf_counter()
+        print(f"[save_episode] np.stack features time: {t13 - t12:.6f} seconds")
 
+        t14 = time.perf_counter()
         self._wait_image_writer()
+        t15 = time.perf_counter()
+        print(f"[save_episode] _wait_image_writer time: {t15 - t14:.6f} seconds")
+
+        t16 = time.perf_counter()
         self._save_episode_table(episode_buffer, episode_index)
+        t17 = time.perf_counter()
+        print(f"[save_episode] _save_episode_table time: {t17 - t16:.6f} seconds")
+
+        t18 = time.perf_counter()
         ep_stats = compute_episode_stats(episode_buffer, self.features)
+        t19 = time.perf_counter()
+        print(f"[save_episode] compute_episode_stats time: {t19 - t18:.6f} seconds")
 
         has_video_keys = len(self.meta.video_keys) > 0
         use_batched_encoding = self.batch_encoding_size > 1
 
+        t20 = time.perf_counter()
         if has_video_keys and not use_batched_encoding:
             self.encode_episode_videos(episode_index)
+        t21 = time.perf_counter()
+        print(f"[save_episode] encode_episode_videos time: {t21 - t20:.6f} seconds")
 
         # `meta.save_episode` should be executed after encoding the videos
+        t22 = time.perf_counter()
         self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats)
+        t23 = time.perf_counter()
+        print(f"[save_episode] meta.save_episode time: {t23 - t22:.6f} seconds")
 
         # Check if we should trigger batch encoding
+        t24 = time.perf_counter()
         if has_video_keys and use_batched_encoding:
             self.episodes_since_last_encoding += 1
             if self.episodes_since_last_encoding == self.batch_encoding_size:
@@ -928,8 +995,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 )
                 self.batch_encode_videos(start_ep, end_ep)
                 self.episodes_since_last_encoding = 0
+        t25 = time.perf_counter()
+        print(f"[save_episode] batch_encode_videos time: {t25 - t24:.6f} seconds")
 
         # Episode data index and timestamp checking
+        t26 = time.perf_counter()
         ep_data_index = get_episode_data_index(self.meta.episodes, [episode_index])
         ep_data_index_np = {k: t.numpy() for k, t in ep_data_index.items()}
         check_timestamps_sync(
@@ -939,18 +1009,24 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.fps,
             self.tolerance_s,
         )
+        t27 = time.perf_counter()
+        print(f"[save_episode] check_timestamps_sync time: {t27 - t26:.6f} seconds")
 
         # Verify that we have one parquet file per episode and the number of video files matches the number of encoded episodes
+        t28 = time.perf_counter()
         parquet_files = list(self.root.rglob("*.parquet"))
         assert len(parquet_files) == self.num_episodes
         video_files = list(self.root.rglob("*.mp4"))
         assert len(video_files) == (self.num_episodes - self.episodes_since_last_encoding) * len(
             self.meta.video_keys
         )
+        t29 = time.perf_counter()
+        print(f"[save_episode] file assertion time: {t29 - t28:.6f} seconds")
 
         if not episode_data:  # Reset the buffer
             self.episode_buffer = self.create_episode_buffer()
-
+        t30 = time.perf_counter()
+        print(f"[save_episode] total time: {t30 - t0:.6f} seconds")
 
     def _save_episode_table(self, episode_buffer: dict, episode_index: int) -> None:
         episode_dict = {key: episode_buffer[key] for key in self.hf_features}
@@ -1098,6 +1174,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.delta_indices = None
         obj.episode_data_index = None
         obj.video_backend = video_backend if video_backend is not None else get_safe_default_codec()
+
+        obj._img_pool = ThreadPoolExecutor(max_workers=8)
+        obj._img_sem = threading.Semaphore(256)
+        obj._img_futs = []    
+        
         return obj
 
 
